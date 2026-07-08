@@ -20,6 +20,7 @@ const struct flow *_unused_flow __attribute__((unused));
 const struct ssl_stat *_unused_ssl_stat __attribute__((unused));
 const struct wire_event *_unused_wire_event __attribute__((unused));
 const struct data_event *_unused_data_event __attribute__((unused));
+const struct close_event *_unused_close_event __attribute__((unused));
 
 /* ----------------------------- maps ----------------------------------- */
 
@@ -288,10 +289,8 @@ static __always_inline void emit_plaintext(__u64 ssl, void *buf, __u64 n,
 	else
 		s->prx += n;
 
-	__u16 *emit = (dir == DIR_OUT) ? &s->out_emit : &s->in_emit;
-	if (*emit >= MAX_DATA_EVENTS)
-		return;
-
+	/* Emit every call so userspace can keep a rolling tail; payload is capped
+	 * at DATA_CAP per event, so cost scales with SSL call count, not bytes. */
 	struct data_event *e = bpf_ringbuf_reserve(&events, sizeof(*e), 0);
 	if (!e)
 		return;
@@ -311,8 +310,33 @@ static __always_inline void emit_plaintext(__u64 ssl, void *buf, __u64 n,
 		return;
 	}
 	e->len = cap;
-	(*emit)++;
 	bpf_ringbuf_submit(e, 0);
+}
+
+/* void SSL_free(SSL *ssl) — session torn down. Emit the final plaintext byte
+ * totals so userspace can attribute them even to short-lived connections that
+ * close between polls, then drop the per-SSL map state so the maps don't grow
+ * without bound. */
+SEC("uprobe/SSL_free")
+int BPF_UPROBE(u_ssl_free, void *ssl)
+{
+	__u64 key = (__u64)ssl;
+	struct ssl_stat *s = bpf_map_lookup_elem(&ssl_stats, &key);
+	if (s) {
+		struct close_event *e = bpf_ringbuf_reserve(&events, sizeof(*e), 0);
+		if (e) {
+			e->type = EVENT_CLOSE;
+			e->pid = bpf_get_current_pid_tgid() >> 32;
+			e->fd = s->fd;
+			e->ssl = key;
+			e->ptx = s->ptx;
+			e->prx = s->prx;
+			bpf_ringbuf_submit(e, 0);
+		}
+		bpf_map_delete_elem(&ssl_stats, &key);
+	}
+	bpf_map_delete_elem(&ssl_fds, &key);
+	return 0;
 }
 
 /* int SSL_set_fd(SSL *ssl, int fd) — build the SSL*->fd map */

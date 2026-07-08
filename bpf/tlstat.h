@@ -10,12 +10,14 @@
 #define DATA_CAP 1024 /* bytes of plaintext captured per uprobe event   */
 
 #define MAX_WIRE_EVENTS 16 /* wire chunks emitted per direction per socket */
-#define MAX_DATA_EVENTS 8 /* plaintext samples emitted per direction per SSL */
+/* Plaintext samples are emitted continuously (no per-SSL cap): userspace keeps
+ * the head (first chunk) plus a rolling tail of the last N bytes per direction. */
 
 /* ring buffer event discriminator (first byte of every event) */
 enum event_type {
-	EVENT_WIRE = 1, /* raw TLS records off the wire, for handshake parsing */
-	EVENT_DATA = 2, /* plaintext captured from the TLS library uprobe      */
+	EVENT_WIRE = 1,  /* raw TLS records off the wire, for handshake parsing */
+	EVENT_DATA = 2,  /* plaintext captured from the TLS library uprobe      */
+	EVENT_CLOSE = 3, /* SSL session freed: final plaintext byte totals      */
 };
 
 /* direction */
@@ -50,8 +52,6 @@ struct ssl_stat {
 	__u64 prx; /* plaintext bytes read (SSL_read)     */
 	__u32 pid;
 	__s32 fd; /* resolved from SSL_set_fd, else -1     */
-	__u16 out_emit;
-	__u16 in_emit;
 } __attribute__((packed));
 
 struct wire_event {
@@ -60,6 +60,19 @@ struct wire_event {
 	__u16 len; /* captured bytes in data[] */
 	__u64 sk;  /* struct sock * key into `flows` */
 	__u8 data[WIRE_CAP];
+} __attribute__((packed));
+
+/* Emitted from SSL_free with the session's final plaintext byte totals, so
+ * userspace can attribute plaintext to short-lived connections that close
+ * before the ssl_stats map is next polled. */
+struct close_event {
+	__u8 type; /* EVENT_CLOSE */
+	__u8 _pad[3];
+	__u32 pid;
+	__s32 fd;
+	__u64 ssl;
+	__u64 ptx;
+	__u64 prx;
 } __attribute__((packed));
 
 struct data_event {

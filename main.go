@@ -37,9 +37,9 @@ func cipherOf(c model.Conn) string {
 }
 
 func peekNote(c model.Conn) string {
-	data, arrow := c.PlainOut, "→"
+	data, arrow := c.HeadOut, "→"
 	if len(data) == 0 {
-		data, arrow = c.PlainIn, "←"
+		data, arrow = c.HeadIn, "←"
 	}
 	if len(data) == 0 {
 		return ""
@@ -64,6 +64,8 @@ func main() {
 	libssl := flag.String("libssl", "", "path to libssl.so for cleartext uprobes (auto-detected if empty)")
 	interval := flag.Duration("interval", 500*time.Millisecond, "map poll interval")
 	dump := flag.Duration("dump", 0, "headless mode: print snapshots for this long, then exit (e.g. 10s)")
+	history := flag.Int("history", 500, "number of closed connections to retain for inspection")
+	peekBytes := flag.Int("peek-bytes", 8192, "rolling plaintext tail size kept per direction, in bytes")
 	flag.Parse()
 
 	if os.Geteuid() != 0 {
@@ -86,12 +88,12 @@ func main() {
 	}
 	defer l.Close()
 
-	store := model.New()
+	store := model.New(*history, *peekBytes)
 
 	// Event reader: fold ring buffer records into the store.
 	go func() {
 		for {
-			w, d, err := l.ReadEvent()
+			w, d, c, err := l.ReadEvent()
 			if err != nil {
 				return // ring buffer closed on shutdown
 			}
@@ -100,6 +102,8 @@ func main() {
 				store.ApplyWire(w)
 			case d != nil:
 				store.ApplyData(d)
+			case c != nil:
+				store.ApplyClose(c)
 			}
 		}
 	}()
@@ -147,7 +151,8 @@ func runDump(store *model.Store, d time.Duration) {
 				tls++
 			}
 		}
-		fmt.Printf("\n=== %s | %d conns, %d TLS ===\n", time.Now().Format("15:04:05"), len(conns), tls)
+		closed := store.SnapshotHistory()
+		fmt.Printf("\n=== %s | %d conns, %d TLS, %d closed ===\n", time.Now().Format("15:04:05"), len(conns), tls, len(closed))
 		for _, c := range conns {
 			if !c.IsTLS || !c.HasEndpoint() {
 				continue
@@ -171,7 +176,45 @@ func runDump(store *model.Store, d time.Duration) {
 				cipherOf(c), c.TxBytes, c.RxBytes, c.PtxBytes, c.PrxBytes,
 				peekNote(c), cert)
 		}
+		for _, c := range closed {
+			if !c.IsTLS {
+				continue
+			}
+			id := c.Info.SNI
+			if id == "" {
+				id = c.Remote.String()
+			}
+			fmt.Printf("  [closed %-8s] pid=%-6d %-12s %-24s %-8s plain=%d/%d%s\n",
+				agoShort(c.ClosedAt), c.Pid, c.Comm, id, tlsVer(c),
+				c.PtxBytes, c.PrxBytes, tailNote(c))
+		}
 	}
+}
+
+func agoShort(t time.Time) string {
+	return time.Since(t).Round(time.Second).String()
+}
+
+// tailNote shows the end of the received plaintext for a closed connection.
+func tailNote(c model.Conn) string {
+	data := c.TailIn
+	if len(data) == 0 {
+		data = c.TailOut
+	}
+	if len(data) == 0 {
+		return ""
+	}
+	s := data
+	if len(s) > 32 {
+		s = s[len(s)-32:]
+	}
+	clean := strings.Map(func(r rune) rune {
+		if r < 0x20 || r > 0x7e {
+			return '.'
+		}
+		return r
+	}, string(s))
+	return fmt.Sprintf("  tail(%dB):…%q", len(data), clean)
 }
 
 // findLibssl locates the system libssl shared object.

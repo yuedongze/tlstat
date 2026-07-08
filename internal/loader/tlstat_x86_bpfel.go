@@ -13,6 +13,17 @@ import (
 	"github.com/cilium/ebpf"
 )
 
+type tlstatCloseEvent struct {
+	_    structs.HostLayout
+	Type uint8
+	Pad  [3]uint8
+	Pid  uint32
+	Fd   int32
+	Ssl  uint64
+	Ptx  uint64
+	Prx  uint64
+}
+
 type tlstatDataEvent struct {
 	_         structs.HostLayout
 	Type      uint8
@@ -56,13 +67,11 @@ type tlstatSslCtx struct {
 }
 
 type tlstatSslStat struct {
-	_       structs.HostLayout
-	Ptx     uint64
-	Prx     uint64
-	Pid     uint32
-	Fd      int32
-	OutEmit uint16
-	InEmit  uint16
+	_   structs.HostLayout
+	Ptx uint64
+	Prx uint64
+	Pid uint32
+	Fd  int32
 }
 
 type tlstatWireEvent struct {
@@ -88,10 +97,12 @@ const (
 	tlstatProgK_tcpSendmsg       = "k_tcp_sendmsg"
 	tlstatProgKrTcpRecvmsg       = "kr_tcp_recvmsg"
 	tlstatProgTpInetSockSetState = "tp_inet_sock_set_state"
+	tlstatProgU_sslFree          = "u_ssl_free"
 	tlstatProgU_sslRead          = "u_ssl_read"
 	tlstatProgU_sslSetFd         = "u_ssl_set_fd"
 	tlstatProgU_sslWrite         = "u_ssl_write"
 	tlstatProgUrSslRead          = "ur_ssl_read"
+	tlstatVarUnusedCloseEvent    = "_unused_close_event"
 	tlstatVarUnusedDataEvent     = "_unused_data_event"
 	tlstatVarUnusedFlow          = "_unused_flow"
 	tlstatVarUnusedSslStat       = "_unused_ssl_stat"
@@ -144,6 +155,7 @@ type tlstatProgramSpecs struct {
 	K_tcpSendmsg       *ebpf.ProgramSpec `ebpf:"k_tcp_sendmsg"`
 	KrTcpRecvmsg       *ebpf.ProgramSpec `ebpf:"kr_tcp_recvmsg"`
 	TpInetSockSetState *ebpf.ProgramSpec `ebpf:"tp_inet_sock_set_state"`
+	U_sslFree          *ebpf.ProgramSpec `ebpf:"u_ssl_free"`
 	U_sslRead          *ebpf.ProgramSpec `ebpf:"u_ssl_read"`
 	U_sslSetFd         *ebpf.ProgramSpec `ebpf:"u_ssl_set_fd"`
 	U_sslWrite         *ebpf.ProgramSpec `ebpf:"u_ssl_write"`
@@ -166,10 +178,11 @@ type tlstatMapSpecs struct {
 //
 // It can be passed ebpf.CollectionSpec.Assign.
 type tlstatVariableSpecs struct {
-	UnusedDataEvent *ebpf.VariableSpec `ebpf:"_unused_data_event"`
-	UnusedFlow      *ebpf.VariableSpec `ebpf:"_unused_flow"`
-	UnusedSslStat   *ebpf.VariableSpec `ebpf:"_unused_ssl_stat"`
-	UnusedWireEvent *ebpf.VariableSpec `ebpf:"_unused_wire_event"`
+	UnusedCloseEvent *ebpf.VariableSpec `ebpf:"_unused_close_event"`
+	UnusedDataEvent  *ebpf.VariableSpec `ebpf:"_unused_data_event"`
+	UnusedFlow       *ebpf.VariableSpec `ebpf:"_unused_flow"`
+	UnusedSslStat    *ebpf.VariableSpec `ebpf:"_unused_ssl_stat"`
+	UnusedWireEvent  *ebpf.VariableSpec `ebpf:"_unused_wire_event"`
 }
 
 // tlstatObjects contains all objects after they have been loaded into the kernel.
@@ -215,10 +228,11 @@ func (m *tlstatMaps) Close() error {
 //
 // It can be passed to loadTlstatObjects or ebpf.CollectionSpec.LoadAndAssign.
 type tlstatVariables struct {
-	UnusedDataEvent *ebpf.Variable `ebpf:"_unused_data_event"`
-	UnusedFlow      *ebpf.Variable `ebpf:"_unused_flow"`
-	UnusedSslStat   *ebpf.Variable `ebpf:"_unused_ssl_stat"`
-	UnusedWireEvent *ebpf.Variable `ebpf:"_unused_wire_event"`
+	UnusedCloseEvent *ebpf.Variable `ebpf:"_unused_close_event"`
+	UnusedDataEvent  *ebpf.Variable `ebpf:"_unused_data_event"`
+	UnusedFlow       *ebpf.Variable `ebpf:"_unused_flow"`
+	UnusedSslStat    *ebpf.Variable `ebpf:"_unused_ssl_stat"`
+	UnusedWireEvent  *ebpf.Variable `ebpf:"_unused_wire_event"`
 }
 
 // tlstatPrograms contains all programs after they have been loaded into the kernel.
@@ -229,6 +243,7 @@ type tlstatPrograms struct {
 	K_tcpSendmsg       *ebpf.Program `ebpf:"k_tcp_sendmsg"`
 	KrTcpRecvmsg       *ebpf.Program `ebpf:"kr_tcp_recvmsg"`
 	TpInetSockSetState *ebpf.Program `ebpf:"tp_inet_sock_set_state"`
+	U_sslFree          *ebpf.Program `ebpf:"u_ssl_free"`
 	U_sslRead          *ebpf.Program `ebpf:"u_ssl_read"`
 	U_sslSetFd         *ebpf.Program `ebpf:"u_ssl_set_fd"`
 	U_sslWrite         *ebpf.Program `ebpf:"u_ssl_write"`
@@ -241,6 +256,7 @@ func (p *tlstatPrograms) Close() error {
 		p.K_tcpSendmsg,
 		p.KrTcpRecvmsg,
 		p.TpInetSockSetState,
+		p.U_sslFree,
 		p.U_sslRead,
 		p.U_sslSetFd,
 		p.U_sslWrite,

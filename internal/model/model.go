@@ -30,10 +30,20 @@ type Conn struct {
 	Preexisting bool
 	FirstSeen   time.Time
 	LastActive  time.Time
+	ClosedAt    time.Time // zero while live; set when retired to history
 	Info        tlsparse.Info
 
-	PlainOut []byte // most informative decrypted sample written (SSL_write)
-	PlainIn  []byte // most informative decrypted sample read (SSL_read)
+	// Decrypted plaintext, per direction: Head is the first chunk (request /
+	// early data), Tail is a rolling window of the last peekBytes.
+	HeadOut []byte
+	TailOut []byte
+	HeadIn  []byte
+	TailIn  []byte
+
+	// plainFinal marks that plaintext totals were finalized by SSL_free; the
+	// per-poll SSL stats join must then leave this connection's totals alone
+	// (its ssl_stats map entry is already gone).
+	plainFinal bool
 
 	// Reassembly buffers: TLS records can be split across syscalls (OpenSSL
 	// reads a 5-byte header then the body), so we concatenate captured chunks
@@ -53,27 +63,42 @@ func (c Conn) HasEndpoint() bool {
 // Store is the thread-safe connection table.
 type Store struct {
 	mu    sync.Mutex
-	conns map[uint64]*Conn
+	conns map[uint64]*Conn // live, keyed by kernel sock*
+
+	// history holds retired (closed) connections, oldest first, capped at
+	// maxHistory. Kept separate from conns so reused sock pointers don't clash.
+	history    []*Conn
+	maxHistory int
+	peekBytes  int // rolling plaintext tail size per direction
 
 	// correlation: (pid,fd) -> sock, resolved lazily via /proc.
 	pidfd map[uint64]uint64
 
-	// latest plaintext sample per SSL*, joined to a connection during the
-	// ssl_stats poll (decouples event timing from connection discovery).
-	plainBySSL map[uint64]sample
+	// plaintext per SSL*, joined to a connection during the ssl_stats poll
+	// (decouples event timing from connection discovery).
+	plainBySSL map[uint64]*sample
 }
 
 type sample struct {
-	out []byte // longest SSL_write payload seen
-	in  []byte // longest SSL_read payload seen
+	headOut, tailOut []byte
+	headIn, tailIn   []byte
 }
 
-// New returns an empty store.
-func New() *Store {
+// New returns an empty store. maxHistory caps retained closed connections;
+// peekBytes is the rolling plaintext tail size kept per direction.
+func New(maxHistory, peekBytes int) *Store {
+	if maxHistory < 0 {
+		maxHistory = 0
+	}
+	if peekBytes < 0 {
+		peekBytes = 0
+	}
 	return &Store{
 		conns:      map[uint64]*Conn{},
+		maxHistory: maxHistory,
+		peekBytes:  peekBytes,
 		pidfd:      map[uint64]uint64{},
-		plainBySSL: map[uint64]sample{},
+		plainBySSL: map[uint64]*sample{},
 	}
 }
 
@@ -109,11 +134,28 @@ func (s *Store) UpdateFlows(flows []loader.Flow) {
 		// TLS traffic seen but no handshake captured => it predates us.
 		c.Preexisting = c.IsTLS && !c.Info.HasClientHello && !c.Info.HasServerHello
 	}
-	// Drop connections that closed and are gone from the map.
+	// Retire connections that closed and are gone from the kernel map into the
+	// history ring so they can still be inspected.
 	for sock, c := range s.conns {
 		if !seen[sock] && c.Closed {
+			s.retire(c)
 			delete(s.conns, sock)
 		}
+	}
+}
+
+// retire moves a closed connection into the capped history ring. Must hold mu.
+func (s *Store) retire(c *Conn) {
+	if c.ClosedAt.IsZero() {
+		c.ClosedAt = time.Now()
+	}
+	c.wireOut, c.wireIn = nil, nil // handshake already parsed into Info
+	if s.maxHistory == 0 {
+		return
+	}
+	s.history = append(s.history, c)
+	if len(s.history) > s.maxHistory {
+		s.history = s.history[len(s.history)-s.maxHistory:]
 	}
 }
 
@@ -155,35 +197,93 @@ func (s *Store) ApplyData(d *loader.DataEvent) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	smp := s.plainBySSL[d.SSL]
-	// Keep the longest sample per direction — the request line and response
-	// headers are more informative than tiny chunked-encoding trailers.
-	if d.Dir == 1 && len(d.Data) > len(smp.out) {
-		smp.out = d.Data
-	} else if d.Dir == 2 && len(d.Data) > len(smp.in) {
-		smp.in = d.Data
+	if smp == nil {
+		smp = &sample{}
+		s.plainBySSL[d.SSL] = smp
 	}
-	s.plainBySSL[d.SSL] = smp
+	// Head = first chunk seen (request / early data); Tail = rolling last
+	// peekBytes. Together they show both ends of the exchange.
+	if d.Dir == 1 {
+		if smp.headOut == nil {
+			smp.headOut = clone(d.Data)
+		}
+		smp.tailOut = appendTail(smp.tailOut, d.Data, s.peekBytes)
+	} else {
+		if smp.headIn == nil {
+			smp.headIn = clone(d.Data)
+		}
+		smp.tailIn = appendTail(smp.tailIn, d.Data, s.peekBytes)
+	}
 }
 
-// UpdateSSLStats recomputes plaintext byte totals from the ssl_stats snapshot
-// and joins the latest plaintext sample to each connection.
+// ApplyClose finalizes plaintext totals for an SSL session that just closed.
+// SSL_free deletes the ssl_stats map entry, so a short-lived connection would
+// otherwise never have its plaintext attributed by the poll. We attribute here
+// and stash the totals so a subsequent retire-to-history keeps them.
+func (s *Store) ApplyClose(e *loader.CloseEvent) {
+	if e == nil {
+		return
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	c := s.resolve(e.Pid, e.Fd)
+	if c != nil {
+		c.PtxBytes = e.Ptx
+		c.PrxBytes = e.Prx
+		if smp := s.plainBySSL[e.SSL]; smp != nil {
+			c.HeadOut, c.TailOut = smp.headOut, smp.tailOut
+			c.HeadIn, c.TailIn = smp.headIn, smp.tailIn
+		}
+		c.plainFinal = true
+	}
+	delete(s.plainBySSL, e.SSL)
+}
+
+// appendTail appends data to buf, keeping at most the last max bytes.
+func appendTail(buf, data []byte, max int) []byte {
+	if max <= 0 {
+		return nil
+	}
+	buf = append(buf, data...)
+	if len(buf) > max {
+		buf = append(buf[:0], buf[len(buf)-max:]...)
+	}
+	return buf
+}
+
+func clone(b []byte) []byte { return append([]byte(nil), b...) }
+
+// UpdateSSLStats recomputes plaintext byte totals from the ssl_stats snapshot,
+// joins head/tail plaintext to each live connection, and evicts cached samples
+// for SSL sessions that have gone away (freed via the SSL_free uprobe).
 func (s *Store) UpdateSSLStats(stats []loader.SSLStat) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	// zero then re-accumulate authoritative totals
+	// zero then re-accumulate authoritative totals — but skip connections whose
+	// plaintext was already finalized by SSL_free (their ssl_stats entry is gone).
 	for _, c := range s.conns {
-		c.PtxBytes, c.PrxBytes = 0, 0
+		if !c.plainFinal {
+			c.PtxBytes, c.PrxBytes = 0, 0
+		}
 	}
+	live := make(map[uint64]bool, len(stats))
 	for _, st := range stats {
+		live[st.SSL] = true
 		c := s.resolve(st.Pid, st.Fd)
 		if c == nil {
 			continue
 		}
 		c.PtxBytes += st.Ptx
 		c.PrxBytes += st.Prx
-		if smp, ok := s.plainBySSL[st.SSL]; ok {
-			c.PlainOut = smp.out
-			c.PlainIn = smp.in
+		if smp := s.plainBySSL[st.SSL]; smp != nil {
+			c.HeadOut, c.TailOut = smp.headOut, smp.tailOut
+			c.HeadIn, c.TailIn = smp.headIn, smp.tailIn
+		}
+	}
+	// Evict cached plaintext for SSL sessions that were freed.
+	for ssl := range s.plainBySSL {
+		if !live[ssl] {
+			delete(s.plainBySSL, ssl)
 		}
 	}
 }
@@ -195,6 +295,17 @@ func (s *Store) Snapshot() []Conn {
 	out := make([]Conn, 0, len(s.conns))
 	for _, c := range s.conns {
 		out = append(out, *c)
+	}
+	return out
+}
+
+// SnapshotHistory returns retired (closed) connections, newest first.
+func (s *Store) SnapshotHistory() []Conn {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	out := make([]Conn, 0, len(s.history))
+	for i := len(s.history) - 1; i >= 0; i-- {
+		out = append(out, *s.history[i])
 	}
 	return out
 }

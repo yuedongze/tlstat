@@ -57,6 +57,16 @@ type DataEvent struct {
 	Data []byte
 }
 
+// CloseEvent carries an SSL session's final plaintext byte totals, emitted from
+// the SSL_free uprobe.
+type CloseEvent struct {
+	Pid uint32
+	Fd  int32
+	SSL uint64
+	Ptx uint64
+	Prx uint64
+}
+
 // Loader owns the loaded eBPF objects, attachments, and the ring buffer.
 type Loader struct {
 	objs   tlstatObjects
@@ -121,6 +131,7 @@ func (l *Loader) attachSSL(path string) error {
 	}
 	for _, u := range []up{
 		{"SSL_set_fd", l.objs.U_sslSetFd, false},
+		{"SSL_free", l.objs.U_sslFree, false},
 		{"SSL_write", l.objs.U_sslWrite, false},
 		{"SSL_read", l.objs.U_sslRead, false},
 		{"SSL_read", l.objs.UrSslRead, true},
@@ -140,21 +151,21 @@ func (l *Loader) attachSSL(path string) error {
 	return nil
 }
 
-// ReadEvent blocks for the next ring buffer record and decodes it. Returns
-// (wire, data) where exactly one is non-nil, or an error.
-func (l *Loader) ReadEvent() (*WireEvent, *DataEvent, error) {
+// ReadEvent blocks for the next ring buffer record and decodes it. Returns at
+// most one of (wire, data, close) non-nil, or an error.
+func (l *Loader) ReadEvent() (*WireEvent, *DataEvent, *CloseEvent, error) {
 	rec, err := l.reader.Read()
 	if err != nil {
-		return nil, nil, err
+		return nil, nil, nil, err
 	}
 	b := rec.RawSample
 	if len(b) < 1 {
-		return nil, nil, nil
+		return nil, nil, nil, nil
 	}
 	switch b[0] {
 	case 1: // EVENT_WIRE
 		if len(b) < 12 {
-			return nil, nil, nil
+			return nil, nil, nil, nil
 		}
 		w := &WireEvent{
 			Dir:  b[1],
@@ -164,10 +175,10 @@ func (l *Loader) ReadEvent() (*WireEvent, *DataEvent, error) {
 		if 12+n <= len(b) {
 			w.Data = append([]byte(nil), b[12:12+n]...)
 		}
-		return w, nil, nil
+		return w, nil, nil, nil
 	case 2: // EVENT_DATA
 		if len(b) < 24 {
-			return nil, nil, nil
+			return nil, nil, nil, nil
 		}
 		d := &DataEvent{
 			Dir: b[1],
@@ -180,9 +191,21 @@ func (l *Loader) ReadEvent() (*WireEvent, *DataEvent, error) {
 		if 24+n <= len(b) {
 			d.Data = append([]byte(nil), b[24:24+n]...)
 		}
-		return nil, d, nil
+		return nil, d, nil, nil
+	case 3: // EVENT_CLOSE — layout: type,_pad[3],pid,fd,ssl,ptx,prx (packed)
+		if len(b) < 36 {
+			return nil, nil, nil, nil
+		}
+		c := &CloseEvent{
+			Pid: le32(b[4:]),
+			Fd:  int32(le32(b[8:])),
+			SSL: le64(b[12:]),
+			Ptx: le64(b[20:]),
+			Prx: le64(b[28:]),
+		}
+		return nil, nil, c, nil
 	}
-	return nil, nil, nil
+	return nil, nil, nil, nil
 }
 
 // Flows returns a snapshot of every tracked socket.

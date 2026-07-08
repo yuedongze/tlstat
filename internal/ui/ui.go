@@ -39,12 +39,21 @@ func (s sortMode) String() string {
 	}
 }
 
+type viewMode int
+
+const (
+	viewActive viewMode = iota
+	viewClosed
+	viewAll
+)
+
 // Model is the bubbletea model.
 type Model struct {
 	store  *model.Store
 	rows   []model.Conn
 	sel    int
 	sortBy sortMode
+	view   viewMode
 	peek   bool
 	w, h   int
 }
@@ -75,6 +84,9 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			}
 		case "enter", " ":
 			m.peek = !m.peek
+		case "tab":
+			m.view = (m.view + 1) % 3
+			m.sel = 0
 		case "s":
 			m.sortBy = (m.sortBy + 1) % 3
 		case "g":
@@ -90,14 +102,21 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 }
 
 func (m *Model) refresh() {
-	all := m.store.Snapshot()
 	m.rows = m.rows[:0]
-	for _, c := range all {
-		if c.HasEndpoint() {
-			m.rows = append(m.rows, c)
+	if m.view == viewActive || m.view == viewAll {
+		for _, c := range m.store.Snapshot() {
+			if c.HasEndpoint() {
+				m.rows = append(m.rows, c)
+			}
 		}
 	}
-	sortConns(m.rows, m.sortBy)
+	active := len(m.rows)
+	if m.view == viewClosed || m.view == viewAll {
+		// SnapshotHistory is already newest-first.
+		m.rows = append(m.rows, m.store.SnapshotHistory()...)
+	}
+	// Sort only the active portion; history keeps its recency order.
+	sortConns(m.rows[:active], m.sortBy)
 	if m.sel >= len(m.rows) {
 		m.sel = len(m.rows) - 1
 	}
@@ -145,8 +164,19 @@ const (
 	wVer    = 8
 	wCipher = 30
 	wIO     = 18
-	wState  = 6
+	wState  = 9
 )
+
+func (v viewMode) String() string {
+	switch v {
+	case viewClosed:
+		return "Closed"
+	case viewAll:
+		return "All"
+	default:
+		return "Active"
+	}
+}
 
 // View renders the whole screen.
 func (m Model) View() string {
@@ -161,16 +191,29 @@ func (m Model) View() string {
 			tlsCount++
 		}
 	}
-	title := fmt.Sprintf(" tlstat — %d connections, %d TLS ", len(m.rows), tlsCount)
-	b.WriteString(styTitle.Render(title))
-	b.WriteString("  " + styDim.Render(fmt.Sprintf("sort:%s", m.sortBy)))
+	b.WriteString(styTitle.Render(" tlstat "))
+	// view tabs — active highlighted
+	b.WriteByte(' ')
+	for _, v := range []viewMode{viewActive, viewClosed, viewAll} {
+		label := " " + v.String() + " "
+		if v == m.view {
+			b.WriteString(styTitle.Render(label))
+		} else {
+			b.WriteString(styDim.Render(label))
+		}
+	}
+	b.WriteString("  " + styDim.Render(fmt.Sprintf("%d rows, %d TLS · sort:%s", len(m.rows), tlsCount, m.sortBy)))
 	b.WriteString("\n\n")
 
-	// header
+	// header — last column is state (active) or close age (closed/all)
+	lastCol := "ST"
+	if m.view != viewActive {
+		lastCol = "CLOSED"
+	}
 	head := strings.Join([]string{
 		trunc("PID", wPID), trunc("COMM", wComm), trunc("REMOTE / SNI", wRemote),
 		trunc("VER", wVer), trunc("CIPHER", wCipher),
-		trunc("WIRE ↑/↓", wIO), trunc("PLAIN ↑/↓", wIO), trunc("ST", wState),
+		trunc("WIRE ↑/↓", wIO), trunc("PLAIN ↑/↓", wIO), trunc(lastCol, wState),
 	}, " ")
 	b.WriteString(styHeader.Render(head))
 	b.WriteByte('\n')
@@ -198,7 +241,7 @@ func (m Model) View() string {
 	}
 
 	b.WriteString(m.renderDetail())
-	b.WriteString(styDim.Render("↑/↓ select · enter peek plaintext · s sort · q quit"))
+	b.WriteString(styDim.Render("↑/↓ select · enter peek · tab active/closed/all · s sort · q quit"))
 	return b.String()
 }
 
@@ -216,11 +259,14 @@ func (m Model) renderRow(c model.Conn, selected bool) string {
 	io := func(up, down uint64) string {
 		return fmt.Sprintf("%s/%s", humanBytes(up), humanBytes(down))
 	}
-	st := "—"
-	if c.Closed {
-		st = "clos"
+	// last column: close age for retired rows, TCP/TLS state otherwise
+	last := "—"
+	if !c.ClosedAt.IsZero() {
+		last = ago(c.ClosedAt)
+	} else if c.Closed {
+		last = "clos"
 	} else if c.IsTLS {
-		st = "TLS"
+		last = "TLS"
 	}
 	cols := strings.Join([]string{
 		trunc(fmt.Sprintf("%d", c.Pid), wPID),
@@ -230,16 +276,32 @@ func (m Model) renderRow(c model.Conn, selected bool) string {
 		trunc(cipher, wCipher),
 		trunc(io(c.TxBytes, c.RxBytes), wIO),
 		trunc(io(c.PtxBytes, c.PrxBytes), wIO),
-		trunc(st, wState),
+		trunc(last, wState),
 	}, " ")
 
 	if selected {
 		return stySel.Render(cols)
 	}
+	if !c.ClosedAt.IsZero() {
+		return styDim.Render(cols) // retired rows are dimmed
+	}
 	if c.IsTLS {
 		return styTLS.Render(cols)
 	}
 	return styDim.Render(cols)
+}
+
+// ago renders a compact "Ns ago" / "Nm ago" for a past timestamp.
+func ago(t time.Time) string {
+	d := time.Since(t)
+	switch {
+	case d < time.Minute:
+		return fmt.Sprintf("%ds ago", int(d.Seconds()))
+	case d < time.Hour:
+		return fmt.Sprintf("%dm ago", int(d.Minutes()))
+	default:
+		return fmt.Sprintf("%dh ago", int(d.Hours()))
+	}
 }
 
 func (m Model) renderDetail() string {
@@ -258,6 +320,10 @@ func (m Model) renderDetail() string {
 	dir := map[uint8]string{1: "outbound (client)", 2: "inbound (server)"}[c.Direction]
 	b.WriteString(lab("process", fmt.Sprintf("%s  pid=%d", c.Comm, c.Pid)))
 	b.WriteString(lab("flow", fmt.Sprintf("%s → %s  %s", c.Local, c.Remote, dir)))
+	if !c.ClosedAt.IsZero() {
+		lifetime := c.ClosedAt.Sub(c.FirstSeen).Round(time.Millisecond)
+		b.WriteString(lab("closed", fmt.Sprintf("%s  (open for %s)", ago(c.ClosedAt), lifetime)))
+	}
 
 	// server identity
 	ident := c.Info.SNI
@@ -296,23 +362,51 @@ func (m Model) renderDetail() string {
 		b.WriteString("  " + styWarn.Render("pre-existing connection — handshake not captured") + "\n")
 	}
 
-	// plaintext peek
+	// plaintext peek — head (first bytes) + rolling tail (last bytes)
 	if m.peek {
 		b.WriteString(div)
-		if len(c.PlainOut) == 0 && len(c.PlainIn) == 0 {
+		if len(c.HeadOut) == 0 && len(c.HeadIn) == 0 && len(c.TailOut) == 0 && len(c.TailIn) == 0 {
 			b.WriteString(styDim.Render("  no plaintext captured (needs OpenSSL app; press enter to hide)") + "\n")
 		} else {
-			if len(c.PlainOut) > 0 {
-				b.WriteString("  " + styLabel.Render("plaintext ") + styDim.Render("SSL_write → (cleartext sent)") + "\n")
-				b.WriteString(indent(hexDump(c.PlainOut, 160)))
-			}
-			if len(c.PlainIn) > 0 {
-				b.WriteString("  " + styLabel.Render("plaintext ") + styDim.Render("SSL_read ← (cleartext received)") + "\n")
-				b.WriteString(indent(hexDump(c.PlainIn, 160)))
-			}
+			b.WriteString(renderPlain("SSL_write →", "sent", c.HeadOut, c.TailOut))
+			b.WriteString(renderPlain("SSL_read ←", "received", c.HeadIn, c.TailIn))
 		}
 	}
 	return b.String()
+}
+
+// renderPlain shows the head and, if distinct, the rolling tail of one
+// direction's decrypted plaintext.
+func renderPlain(fn, verb string, head, tail []byte) string {
+	if len(head) == 0 && len(tail) == 0 {
+		return ""
+	}
+	var b strings.Builder
+	b.WriteString("  " + styLabel.Render("plaintext ") + styDim.Render(fmt.Sprintf("%s (cleartext %s)", fn, verb)) + "\n")
+	if len(head) > 0 {
+		b.WriteString("  " + styDim.Render("head:") + "\n")
+		b.WriteString(indent(hexDump(head, 128)))
+	}
+	// Only show the tail when it carries bytes beyond the head.
+	if len(tail) > 0 && !bytesEqualPrefix(head, tail) {
+		b.WriteString("  " + styDim.Render(fmt.Sprintf("tail (last %s):", humanBytes(uint64(len(tail))))) + "\n")
+		b.WriteString(indent(hexDump(tail, 128)))
+	}
+	return b.String()
+}
+
+// bytesEqualPrefix reports whether tail is fully contained at the start of head
+// (i.e. the whole exchange fit in the head, so the tail adds nothing new).
+func bytesEqualPrefix(head, tail []byte) bool {
+	if len(tail) > len(head) {
+		return false
+	}
+	for i := range tail {
+		if head[i] != tail[i] {
+			return false
+		}
+	}
+	return true
 }
 
 func indent(s string) string {
