@@ -1,2 +1,15 @@
-./tlstat
+# Compiled binary
+/tlstat
+
+# Test binaries and coverage
+*.test
+*.out
+coverage.*
+
+# macOS
 .DS_Store
+
+# Editor / IDE
+.idea/
+.vscode/
+*.swp
