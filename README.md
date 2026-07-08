@@ -6,6 +6,9 @@ parses the handshake for endpoints, server identity, and negotiated crypto,
 counts bytes in/out live, and — for OpenSSL applications — captures the
 **cleartext before encryption**, the one vantage point where plaintext exists.
 
+![](./images/main.png)
+![](./images/expanded.png)
+
 ```
  tlstat — 6 connections, 3 TLS   sort:recent
 PID     COMM           REMOTE / SNI             VER      CIPHER                         WIRE ↑/↓        PLAIN ↑/↓       ST
