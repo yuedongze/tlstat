@@ -1,4 +1,4 @@
-module github.com/tlstat/tlstat
+module github.com/yuedongze/tlstat
 
 go 1.25.0
 

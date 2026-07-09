@@ -13,10 +13,10 @@ import (
 
 	tea "github.com/charmbracelet/bubbletea"
 
-	"github.com/tlstat/tlstat/internal/loader"
-	"github.com/tlstat/tlstat/internal/model"
-	"github.com/tlstat/tlstat/internal/tlsparse"
-	"github.com/tlstat/tlstat/internal/ui"
+	"github.com/yuedongze/tlstat/internal/loader"
+	"github.com/yuedongze/tlstat/internal/model"
+	"github.com/yuedongze/tlstat/internal/tlsparse"
+	"github.com/yuedongze/tlstat/internal/ui"
 )
 
 func tlsVer(c model.Conn) string {

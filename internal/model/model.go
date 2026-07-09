@@ -9,8 +9,8 @@ import (
 	"sync"
 	"time"
 
-	"github.com/tlstat/tlstat/internal/loader"
-	"github.com/tlstat/tlstat/internal/tlsparse"
+	"github.com/yuedongze/tlstat/internal/loader"
+	"github.com/yuedongze/tlstat/internal/tlsparse"
 )
 
 // Conn is one tracked connection.

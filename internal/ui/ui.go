@@ -10,8 +10,8 @@ import (
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
 
-	"github.com/tlstat/tlstat/internal/model"
-	"github.com/tlstat/tlstat/internal/tlsparse"
+	"github.com/yuedongze/tlstat/internal/model"
+	"github.com/yuedongze/tlstat/internal/tlsparse"
 )
 
 type tickMsg time.Time
